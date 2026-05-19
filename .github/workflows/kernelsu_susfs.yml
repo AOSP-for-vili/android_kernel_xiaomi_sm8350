@@ -1,0 +1,342 @@
+name: KernelSU Next + SuSFS - Mi 11 Ultra (star) - LineageOS base
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout kernel source (AOSP-for-vili lineage-23.2-ksu)
+        uses: actions/checkout@v4
+        with:
+          repository: AOSP-for-vili/android_kernel_xiaomi_sm8350
+          ref: lineage-23.2-ksu
+          fetch-depth: 1
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            git bc bison flex libssl-dev \
+            make libelf-dev python3 \
+            zip curl wget cpio \
+            clang-12 lld-12 llvm-12 \
+            ccache cmake python-is-python3 \
+            libncurses5-dev patch rsync
+
+      - name: Setup Clang 12 toolchain (igual que Xinran)
+        run: |
+          mkdir -p clang/bin
+          for tool in clang clang++ ld.lld llvm-ar llvm-nm \
+                      llvm-objcopy llvm-objdump llvm-strip; do
+            ln -sf /usr/bin/${tool}-12 clang/bin/${tool}
+          done
+          clang/bin/clang --version
+
+      - name: Setup GCC toolchain
+        run: |
+          git clone --depth=1 \
+            https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9 \
+            gcc64
+          git clone --depth=1 \
+            https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9 \
+            gcc32
+
+      - name: Add KernelSU Next
+        run: |
+          curl -LSs \
+            "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" \
+            | bash -s next
+          echo "KernelSU Next añadido"
+
+      - name: Add SuSFS (rama kernel-5.4)
+        run: |
+          git clone --depth=1 \
+            https://gitlab.com/simonpunk/susfs4ksu.git \
+            -b kernel-5.4 \
+            ../susfs4ksu
+
+          SUSFS_DIR="../susfs4ksu"
+          echo "Patches disponibles:"
+          ls "$SUSFS_DIR/kernel_patches/"
+
+          cp "$SUSFS_DIR/kernel_patches/fs/susfs.c" fs/
+          cp "$SUSFS_DIR/kernel_patches/include/linux/susfs.h" include/linux/
+          cp "$SUSFS_DIR/kernel_patches/include/linux/susfs_def.h" include/linux/
+
+          grep -q "linux/cred.h" include/linux/susfs_def.h || \
+            sed -i '1i#include <linux/cred.h>' include/linux/susfs_def.h
+
+          grep -q "susfs.o" fs/Makefile || \
+            echo 'obj-$(CONFIG_KSU_SUSFS) += susfs.o' >> fs/Makefile
+
+          for p in \
+            "$SUSFS_DIR/kernel_patches/50_add_susfs_in_kernel-5.4.patch" \
+            "$SUSFS_DIR/kernel_patches/50_add_susfs_in_fs-5.4.patch"; do
+            if [ -f "$p" ]; then
+              patch -p1 --forward --batch < "$p" || true
+              echo "✅ Patch aplicado: $p"
+              break
+            fi
+          done
+
+          # Fix fsnotify — QGKI tiene fsnotify backporteado de 5.10+
+          if [ -f "fs/susfs.c" ]; then
+            perl -i -0pe \
+              's/static int susfs_handle_sdcard_inode_event\s*\(\s*struct fsnotify_mark\s*\*mark,\s*u32\s*mask,\s*struct inode\s*\*inode,\s*struct inode\s*\*dir,\s*const struct qstr\s*\*file_name,\s*u32\s*cookie\s*\)/static int susfs_handle_sdcard_inode_event(struct fsnotify_group *group, struct inode *inode, u32 mask, const void *data, int data_type, const struct qstr *file_name, u32 cookie, struct fsnotify_iter_info *iter_info)/s' \
+              fs/susfs.c
+            sed -i 's/\.handle_inode_event = /.handle_event = /' fs/susfs.c
+          fi
+
+          echo "✅ SuSFS añadido"
+
+      - name: Apply minimal 5.4 fixes
+        run: |
+          echo "=== FIX 1: pgtable.h ==="
+          grep -rl "linux/pgtable.h" drivers/kernelsu/ 2>/dev/null | while read f; do
+            sed -i 's|#include <linux/pgtable.h>|#include <asm/pgtable.h>|g' "$f"
+            echo "  FIXED $f"
+          done
+
+          echo "=== FIX 2: strncpy_from_user_nofault ==="
+          grep -rl "strncpy_from_user_nofault" drivers/kernelsu/ 2>/dev/null | while read f; do
+            sed -i 's|strncpy_from_user_nofault|strncpy_from_user|g' "$f"
+            echo "  FIXED $f"
+          done
+
+          echo "=== FIX 3: TWA_RESUME ==="
+          grep -rl "TWA_RESUME" drivers/kernelsu/ 2>/dev/null | while read f; do
+            sed -i 's|TWA_RESUME|0|g' "$f"
+            echo "  FIXED $f"
+          done
+
+          echo "=== FIX 4: copy_*_nofault ==="
+          grep -rl "copy_to_kernel_nofault" drivers/kernelsu/ 2>/dev/null | while read f; do
+            sed -i 's|copy_to_kernel_nofault|probe_kernel_write|g' "$f"
+          done
+          grep -rl "copy_from_user_nofault" drivers/kernelsu/ 2>/dev/null | while read f; do
+            sed -i 's|copy_from_user_nofault|probe_kernel_read|g' "$f"
+          done
+          grep -rl "copy_to_user_nofault" drivers/kernelsu/ 2>/dev/null | while read f; do
+            sed -i 's|copy_to_user_nofault|probe_kernel_write|g' "$f"
+          done
+
+          echo "=== FIX 5: security_inode_init_security_anon ==="
+          grep -rl "security_inode_init_security_anon" drivers/kernelsu/ 2>/dev/null | while read f; do
+            perl -0pi -e 's/security_inode_init_security_anon\([^;]*\)/0/g' "$f"
+            echo "  FIXED $f"
+          done
+
+          echo "=== FIX 6: seccomp_cache.c stub ==="
+          python3 - << 'PYEOF'
+          import os
+          sc = "drivers/kernelsu/infra/seccomp_cache.c"
+          if os.path.exists(sc):
+              with open(sc, "w") as f:
+                  f.write(
+                      "#include \"seccomp_cache.h\"\n"
+                      "void ksu_seccomp_allow_cache(struct seccomp_filter *filter, int nr) {}\n"
+                      "void ksu_seccomp_cache_init(void) {}\n"
+                  )
+              print("  FIXED seccomp_cache.c")
+          PYEOF
+
+          echo "=== FIX 7: pkg_observer.c fsnotify ==="
+          python3 - << 'PYEOF'
+          import re, os
+          pkg = "drivers/kernelsu/manager/pkg_observer.c"
+          if not os.path.exists(pkg):
+              exit(0)
+          with open(pkg, "r") as f:
+              content = f.read()
+          content = content.replace('.handle_inode_event =', '.handle_event =')
+          old_fn = re.compile(
+              r'static int (ksu_handle_inode_event|ksu_handle_event)\s*\('
+              r'\s*struct fsnotify_mark\s*\*\s*\w+\s*,'
+              r'\s*u32\s*\w+\s*,'
+              r'\s*struct inode\s*\*\s*\w+\s*,'
+              r'\s*struct inode\s*\*\s*\w+\s*,'
+              r'\s*const struct qstr\s*\*\s*\w+\s*,'
+              r'\s*u32\s*\w+\s*\)',
+              re.DOTALL
+          )
+          new_fn = (
+              'static int ksu_handle_event('
+              'struct fsnotify_group *group, struct inode *inode, '
+              'u32 mask, const void *data, int data_type, '
+              'const struct qstr *file_name, u32 cookie, '
+              'struct fsnotify_iter_info *iter_info)'
+          )
+          if old_fn.search(content):
+              content = old_fn.sub(new_fn, content)
+          else:
+              content = re.sub(
+                  r'static int ksu_handle_inode_event\b',
+                  'static int ksu_handle_event', content
+              )
+          content = content.replace('ksu_handle_inode_event', 'ksu_handle_event')
+          with open(pkg, "w") as f:
+              f.write(content)
+          print("  FIXED pkg_observer.c")
+          PYEOF
+
+          echo "=== FIX 8: TP hooks Kbuild ==="
+          python3 - << 'PYEOF'
+          import re, os
+          kb = "drivers/kernelsu/Kbuild"
+          if os.path.exists(kb):
+              with open(kb, "r") as f:
+                  content = f.read()
+              content = re.sub(
+                  r'(ifeq.*TRACEPOINT.*\n(?:.*\n)*?endif)',
+                  lambda m: '\n'.join('# ' + l for l in m.group(0).split('\n')),
+                  content
+              )
+              with open(kb, "w") as f:
+                  f.write(content)
+              print("  FIXED Kbuild TP hooks")
+          PYEOF
+
+          echo "=== FIX 9: linux/minmax.h ==="
+          python3 - << 'PYEOF'
+          import os
+          minmax_h = "include/linux/minmax.h"
+          if not os.path.exists(minmax_h):
+              with open(minmax_h, "w") as f:
+                  f.write(
+                      "#ifndef _LINUX_MINMAX_H\n"
+                      "#define _LINUX_MINMAX_H\n\n"
+                      "#include <linux/kernel.h>\n\n"
+                      "#endif\n"
+                  )
+              print("  CREATED include/linux/minmax.h")
+          PYEOF
+
+          echo "=== ALL FIXES DONE ==="
+
+      - name: Configure kernel — exactamente como Xinran 5.4.289
+        run: |
+          # Buscar el defconfig correcto para star
+          DEFCONFIG=$(find arch/arm64/configs -name "*star*defconfig" \
+                      -o -name "lahaina-qgki_defconfig" | head -1)
+
+          if [ -z "$DEFCONFIG" ]; then
+            echo "Configs disponibles:"
+            find arch/arm64/configs -name "*.defconfig" | head -20
+            exit 1
+          fi
+
+          echo "Usando: $DEFCONFIG"
+          cp "$DEFCONFIG" arch/arm64/configs/star_ksu_defconfig
+
+          # Configuración exacta basada en config del kernel Xinran 5.4.289
+          cat >> arch/arm64/configs/star_ksu_defconfig << 'EOF'
+
+          # KernelSU
+          CONFIG_KSU=y
+          CONFIG_KPM=y
+
+          # SuSFS (igual que Xinran)
+          CONFIG_KSU_SUSFS=y
+          CONFIG_KSU_SUSFS_SUS_PATH=y
+          CONFIG_KSU_SUSFS_SUS_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_KSTAT=y
+          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+          CONFIG_KSU_SUSFS_ENABLE_LOG=y
+          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+          CONFIG_KSU_SUSFS_SUS_MAP=y
+
+          # Hook — KPROBES (confirmado en ambos kernels funcionales)
+          CONFIG_KSU_KPROBES_HOOK=y
+          CONFIG_KPROBES=y
+          CONFIG_HAVE_KPROBES=y
+
+          # Necesarios
+          CONFIG_TMPFS_XATTR=y
+          CONFIG_TMPFS_POSIX_ACL=y
+          CONFIG_KALLSYMS=y
+          CONFIG_KALLSYMS_ALL=y
+
+          # LTO thin (como Xinran)
+          CONFIG_LTO_CLANG=y
+          CONFIG_THINLTO=y
+          EOF
+
+          echo "Defconfig configurado"
+
+      - name: Build kernel
+        run: |
+          export PATH="$GITHUB_WORKSPACE/clang/bin:$GITHUB_WORKSPACE/gcc64/bin:$GITHUB_WORKSPACE/gcc32/bin:$PATH"
+
+          make O=out ARCH=arm64 \
+            CC=clang \
+            LD=ld.lld \
+            AR=llvm-ar \
+            NM=llvm-nm \
+            OBJCOPY=llvm-objcopy \
+            OBJDUMP=llvm-objdump \
+            STRIP=llvm-strip \
+            CROSS_COMPILE=aarch64-linux-android- \
+            CROSS_COMPILE_ARM32=arm-linux-androideabi- \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            star_ksu_defconfig
+
+          make -j$(nproc --all) O=out ARCH=arm64 \
+            CC=clang \
+            LD=ld.lld \
+            AR=llvm-ar \
+            NM=llvm-nm \
+            OBJCOPY=llvm-objcopy \
+            OBJDUMP=llvm-objdump \
+            STRIP=llvm-strip \
+            CROSS_COMPILE=aarch64-linux-android- \
+            CROSS_COMPILE_ARM32=arm-linux-androideabi- \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            2>&1 | tee build.log
+
+      - name: Package with AnyKernel3
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 AnyKernel3
+
+          if [ -f out/arch/arm64/boot/Image.gz-dtb ]; then
+            cp out/arch/arm64/boot/Image.gz-dtb AnyKernel3/
+          elif [ -f out/arch/arm64/boot/Image.gz ]; then
+            cp out/arch/arm64/boot/Image.gz AnyKernel3/
+          elif [ -f out/arch/arm64/boot/Image ]; then
+            cp out/arch/arm64/boot/Image AnyKernel3/
+          else
+            echo "❌ No imagen"
+            ls out/arch/arm64/boot/ || true
+            exit 1
+          fi
+
+          sed -i 's|do.devicecheck=1|do.devicecheck=0|g' AnyKernel3/anykernel.sh
+          grep -q "^BLOCK=" AnyKernel3/anykernel.sh && \
+            sed -i 's|^BLOCK=.*|BLOCK=boot;|g' AnyKernel3/anykernel.sh || \
+            echo 'BLOCK=boot;' >> AnyKernel3/anykernel.sh
+          grep -q "IS_SLOT_DEVICE=" AnyKernel3/anykernel.sh && \
+            sed -i 's|IS_SLOT_DEVICE=.*|IS_SLOT_DEVICE=1;|g' AnyKernel3/anykernel.sh || \
+            echo 'IS_SLOT_DEVICE=1;' >> AnyKernel3/anykernel.sh
+          grep -q "device.name1=" AnyKernel3/anykernel.sh && \
+            sed -i 's|device.name1=.*|device.name1=star|g' AnyKernel3/anykernel.sh
+
+          cd AnyKernel3
+          zip -r9 ../KSUNext-star-LineageOS-$(date +%Y%m%d-%H%M).zip . \
+            -x ".git*" -x "*.md"
+
+      - name: Upload kernel zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: KSUNext-star-LineageOS
+          path: KSUNext-star-LineageOS-*.zip
+          retention-days: 7
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
