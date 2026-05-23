@@ -178,10 +178,13 @@ static int dp_parser_misc(struct dp_parser *parser)
 				&parser->pixel_base_off[i]);
 	}
 
-	parser->display_type = of_get_property(of_node, "qcom,display-type",
-					NULL);
-	if (!parser->display_type)
-		parser->display_type = "unknown";
+	parser->display_type = of_get_property(of_node, "qcom,display-type", NULL);
+	if (!parser->display_type) {
+		if (parser->is_edp)
+			parser->display_type = "primary";
+		else
+			parser->display_type = "secondary";
+	}
 
 	parser->panel_notifier_support = of_property_read_bool(of_node,
 			"qcom,panel-notifier-support");
