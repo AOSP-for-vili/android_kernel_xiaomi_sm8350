@@ -263,10 +263,29 @@ static void apr_modem_down(unsigned long opcode)
 
 static void apr_modem_up(void)
 {
+	int j, k;
+
 	if (apr_cmpxchg_modem_state(APR_SUBSYS_DOWN, APR_SUBSYS_UP) ==
 							APR_SUBSYS_DOWN)
 		wake_up(&modem_wait);
 	is_modem_up = 1;
+
+	if (apr_reset_workqueue)
+		flush_workqueue(apr_reset_workqueue);
+
+	for (j = 0; j < APR_CLIENT_MAX; j++) {
+		for (k = 0; k < APR_SVC_MAX; k++) {
+			struct apr_svc *svc = &client[APR_DEST_MODEM][j].svc[k];
+
+			mutex_lock(&svc->m_lock);
+			if (svc->need_reset) {
+				pr_info("%s: Clearing stale need_reset for modem client %d svc %d\n",
+					__func__, j, k);
+				svc->need_reset = 0x0;
+			}
+			mutex_unlock(&svc->m_lock);
+		}
+	}
 }
 
 enum apr_subsys_state apr_get_q6_state(void)
@@ -315,9 +334,29 @@ static void apr_add_child_devices(struct work_struct *work)
 
 static void apr_adsp_up(void)
 {
+	int j, k;
+
 	pr_info("%s: Q6 is Up\n", __func__);
 	place_marker("M - ADSP Ready");
 	apr_set_q6_state(APR_SUBSYS_LOADED);
+
+	if (apr_reset_workqueue)
+		flush_workqueue(apr_reset_workqueue);
+
+	for (j = 0; j < APR_CLIENT_MAX; j++) {
+		for (k = 0; k < APR_SVC_MAX; k++) {
+			struct apr_svc *svc = &client[APR_DEST_QDSP6][j].svc[k];
+
+			mutex_lock(&svc->m_lock);
+			if (svc->need_reset) {
+				pr_info("%s: Clearing stale need_reset for client %d svc %d (svc_cnt=%u)\n",
+					__func__, j, k, svc->svc_cnt);
+				svc->need_reset = 0x0;
+			}
+			mutex_unlock(&svc->m_lock);
+		}
+	}
+
 	/* register adsp hardware */
 #ifdef CONFIG_MMHARDWARE_DETECTION
 	register_kobj_under_mmsysfs(MM_HW_ADSP, MM_HARDWARE_SYSFS_ADSP_FOLDER);
@@ -582,10 +621,19 @@ struct apr_svc *apr_register(char *dest, char *svc_name, apr_fn svc_fn,
 	mutex_lock(&svc->m_lock);
 	clnt->id = client_id;
 	if (svc->need_reset) {
-		mutex_unlock(&svc->m_lock);
-		pr_err_ratelimited("APR: Service needs reset\n");
-		svc = NULL;
-		goto done;
+		if ((dest_id == APR_DEST_QDSP6 &&
+		     apr_get_q6_state() == APR_SUBSYS_LOADED) ||
+		    (dest_id == APR_DEST_MODEM &&
+		     apr_get_modem_state() == APR_SUBSYS_UP)) {
+			pr_info("%s: Subsystem is up, clearing stale need_reset for svc %s\n",
+				__func__, svc_name);
+			svc->need_reset = 0x0;
+		} else {
+			mutex_unlock(&svc->m_lock);
+			pr_err_ratelimited("APR: Service needs reset\n");
+			svc = NULL;
+			goto done;
+		}
 	}
 	svc->id = svc_id;
 	svc->dest_id = dest_id;
@@ -611,10 +659,10 @@ struct apr_svc *apr_register(char *dest, char *svc_name, apr_fn svc_fn,
 		if (!svc->fn) {
 			if (!svc->svc_cnt)
 				clnt->svc_cnt++;
-			svc->fn = svc_fn;
-			svc->priv = priv;
 			svc->svc_cnt++;
 		}
+		svc->fn = svc_fn;
+		svc->priv = priv;
 	}
 
 	mutex_unlock(&svc->m_lock);
@@ -966,6 +1014,7 @@ int apr_deregister(void *handle)
 	if (!svc->svc_cnt) {
 		pr_err("%s: svc already deregistered. svc = %pK\n",
 			__func__, svc);
+		svc->need_reset = 0x0;
 		mutex_unlock(&svc->m_lock);
 		return -EINVAL;
 	}
@@ -979,9 +1028,15 @@ int apr_deregister(void *handle)
 			svc->port_cnt--;
 		svc->svc_cnt--;
 		if (!svc->svc_cnt) {
-			client[dest_id][client_id].svc_cnt--;
+			if (client[dest_id][client_id].svc_cnt)
+				client[dest_id][client_id].svc_cnt--;
 			pr_debug("%s: service is reset %pK\n", __func__, svc);
 		}
+	}
+
+	if (!svc->port_cnt) {
+		memset(svc->port_fn, 0, sizeof(svc->port_fn));
+		memset(svc->port_priv, 0, sizeof(svc->port_priv));
 	}
 
 	if (!svc->svc_cnt) {
@@ -991,6 +1046,9 @@ int apr_deregister(void *handle)
 		svc->dest_id = 0;
 		svc->client_id = 0;
 		svc->need_reset = 0x0;
+		svc->port_cnt = 0;
+		memset(svc->port_fn, 0, sizeof(svc->port_fn));
+		memset(svc->port_priv, 0, sizeof(svc->port_priv));
 	}
 	if (client[dest_id][client_id].handle &&
 	    !client[dest_id][client_id].svc_cnt) {

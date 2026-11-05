@@ -1011,10 +1011,19 @@ struct apr_svc *apr_register(char *dest, char *svc_name, apr_fn svc_fn,
 	mutex_lock(&svc->m_lock);
 	clnt->id = client_id;
 	if (svc->need_reset) {
-		mutex_unlock(&svc->m_lock);
-		pr_err("APR: Service needs reset\n");
-		svc = NULL;
-		goto done;
+		if ((dest_id == APR_DEST_QDSP6 &&
+		     apr_get_q6_state() == APR_SUBSYS_LOADED) ||
+		    (dest_id == APR_DEST_MODEM &&
+		     apr_get_modem_state() == APR_SUBSYS_UP)) {
+			pr_info("%s: Subsystem is up, clearing stale need_reset for svc %s\n",
+				__func__, svc_name);
+			svc->need_reset = 0x0;
+		} else {
+			mutex_unlock(&svc->m_lock);
+			pr_err("APR: Service needs reset\n");
+			svc = NULL;
+			goto done;
+		}
 	}
 	svc->id = svc_id;
 	svc->vm_dest_svc = dest_svc;
