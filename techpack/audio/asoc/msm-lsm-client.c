@@ -3198,14 +3198,15 @@ static int msm_lsm_close(struct snd_pcm_substream *substream)
 	int fe_id = 0;
 
 	if (!substream->private_data) {
-		pr_err("%s: Invalid private_data", __func__);
+		pr_err("%s: Invalid private_data\n", __func__);
 		return -EINVAL;
 	}
+	rtd = substream->private_data;
+	component = snd_soc_rtdcom_lookup(rtd, DRV_NAME);
 	if (!component || !component->dev) {
 		pr_err("%s: Invalid component\n", __func__);
 		return -EINVAL;
 	}
-	rtd = substream->private_data;
 	lsm_dev = (struct lsm_char_dev *) dev_get_drvdata(component->dev);
 	if (!lsm_dev) {
 		pr_err("%s: platform data is NULL\n", __func__);
